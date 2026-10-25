@@ -25,6 +25,89 @@ class SubtitleTests(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
+    def test_batch_language_labels_resolve_per_video(self):
+        available = [{'language': 'zh', 'source': 'manual', 'translated': False},
+                     {'language': 'en', 'source': 'auto', 'translated': False}]
+        self.assertEqual(h.matching_subtitle_tracks(available, 'zh-Hans', 'manual'), [available[0]])
+        self.assertEqual(h.matching_subtitle_tracks(available, 'en-orig', 'auto'), [available[1]])
+        self.assertEqual(h.matching_subtitle_tracks(available, 'zh-Hant', 'manual'), [])
+        self.assertEqual(h.matching_subtitle_tracks(available, 'zh', 'auto'), [])
+
+    def test_missing_language_reported_and_available_language_downloaded(self):
+        available = [{'language': 'zh', 'source': 'manual', 'translated': False}]
+        file = self.out / 'test.srt'
+        file.write_text('subtitle', encoding='utf-8')
+        requested = [{'language': 'en', 'source': 'manual'}, {'language': 'zh-Hans', 'source': 'manual'}]
+        with patch.object(h, 'list_subtitle_tracks', return_value=available), patch.object(h, 'execute', return_value=(0, [], [file])) as execute:
+            ok, message = h.optional_subtitles('test', 'youtube', 'url', False, requested)
+        self.assertFalse(ok)
+        self.assertIn('en/原始字幕', message)
+        self.assertIn('zh/manual', message)
+        self.assertEqual(execute.call_count, 1)
+        cmd = execute.call_args.args[1]
+        self.assertEqual(cmd[cmd.index('--sub-langs') + 1], 'zh')
+
+    def test_default_preserves_manual_original_when_no_auto_track(self):
+        file = self.out / 'manual.srt'
+        file.write_text('subtitle', encoding='utf-8')
+        available = [{'language': 'zh', 'source': 'manual', 'translated': False}]
+        with patch.object(h, 'list_subtitle_tracks', return_value=available), patch.object(h, 'execute', return_value=(0, [], [file])) as execute:
+            ok, message = h.optional_subtitles('test', 'youtube', 'url', False)
+        self.assertTrue(ok)
+        self.assertIn('zh/manual', message)
+
+    def test_explicit_auto_never_downloads_translated_track(self):
+        available = [{'language': 'en', 'source': 'auto', 'translated': True},
+                     {'language': 'en-orig', 'source': 'auto', 'translated': False}]
+        file = self.out / 'auto.srt'
+        file.write_text('subtitle', encoding='utf-8')
+        for translated, expected in [(False, r'en\-orig'), (True, 'en')]:
+            selected = [{'language': 'en', 'source': 'auto', 'translated': translated}]
+            self.assertEqual(h.validate_subtitle_tracks(selected), selected)
+            with patch.object(h, 'list_subtitle_tracks', return_value=available), patch.object(h, 'execute', return_value=(0, [], [file])) as execute:
+                ok, _ = h.optional_subtitles('test', 'youtube', 'url', False, selected)
+            self.assertTrue(ok)
+            cmd = execute.call_args.args[1]
+            self.assertEqual(cmd[cmd.index('--sub-langs') + 1], expected)
+
+    def test_translation_validation_and_no_silent_fallback(self):
+        for selected in [[{'language': 'en', 'source': 'manual', 'translated': True}],
+                         [{'language': 'en', 'source': 'auto', 'translated': 'false'}]]:
+            with self.assertRaises(ValueError):
+                h.validate_subtitle_tracks(selected)
+        with patch.object(h, 'list_subtitle_tracks', return_value=[{'language': 'en', 'source': 'auto', 'translated': True}]), patch.object(h, 'execute') as execute:
+            ok, message = h.optional_subtitles('test', 'youtube', 'url', False,
+                [{'language': 'en', 'source': 'auto', 'translated': False}])
+        self.assertFalse(ok)
+        self.assertIn('自动生成', message)
+        execute.assert_not_called()
+
+    def test_missing_track_falls_back_to_chinese_auto_once(self):
+        available = [{'language': 'zh', 'source': 'auto', 'translated': False}]
+        file = self.out / 'fallback.srt'
+        file.write_text('subtitle', encoding='utf-8')
+        requested = [{'language': lang, 'source': 'manual', 'fallback': 'zh-auto'} for lang in ['en', 'zh-Hans']]
+        self.assertEqual(h.validate_subtitle_tracks(requested), requested)
+        with patch.object(h, 'list_subtitle_tracks', return_value=available), patch.object(h, 'execute', return_value=(0, [], [file])) as execute:
+            ok, message = h.optional_subtitles('test', 'youtube', 'url', False, requested)
+        self.assertTrue(ok)
+        self.assertIn('替代', message)
+        self.assertEqual(execute.call_count, 1)
+        command = execute.call_args.args[1]
+        self.assertEqual(command[command.index('--sub-langs') + 1], 'zh')
+
+    def test_fallback_does_not_use_translation_or_override_none(self):
+        for available, fallback in [([{'language': 'zh-Hans', 'source': 'auto', 'translated': True}], 'zh-auto'),
+                                    ([{'language': 'zh', 'source': 'auto', 'translated': False}], 'none')]:
+            with patch.object(h, 'list_subtitle_tracks', return_value=available), patch.object(h, 'execute') as execute:
+                ok, _ = h.optional_subtitles('test', 'youtube', 'url', False,
+                    [{'language': 'en', 'source': 'manual', 'fallback': fallback}])
+            self.assertFalse(ok)
+            execute.assert_not_called()
+        for value in ['invalid', {}, None]:
+            with self.assertRaises(ValueError):
+                h.validate_subtitle_tracks([{'language': 'en', 'source': 'manual', 'fallback': value}])
+
     def test_selection_validation(self):
         track = {'language': 'en-orig', 'source': 'auto'}
         self.assertEqual(h.validate_subtitle_tracks([track, track]), [track])
@@ -70,7 +153,7 @@ class SubtitleTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index('--sub-langs') + 1], r'en\-orig')
 
     def test_no_file_is_failure_even_with_zero_exit(self):
-        with patch.object(h, 'execute', return_value=(0, [], [])):
+        with patch.object(h, 'list_subtitle_tracks', return_value=[{'language': 'en', 'source': 'auto'}]), patch.object(h, 'execute', return_value=(0, [], [])):
             ok, _ = h.optional_subtitles('test', 'youtube', 'url', False,
                                         [{'language': 'en', 'source': 'auto'}])
         self.assertFalse(ok)
@@ -79,7 +162,7 @@ class SubtitleTests(unittest.TestCase):
         file = self.out / 'test.srt'
         file.write_text('subtitle', encoding='utf-8')
         tracks = [{'language': 'zh-Hans', 'source': 'auto'}, {'language': 'en-orig', 'source': 'auto'}]
-        with patch.object(h, 'execute', side_effect=[(1, ['HTTP Error 429'], []),
+        with patch.object(h, 'list_subtitle_tracks', return_value=tracks), patch.object(h, 'execute', side_effect=[(1, ['HTTP Error 429'], []),
                                                    (1, ['HTTP Error 429'], []), (0, [], [file])]) as execute:
             ok, message = h.optional_subtitles('test', 'youtube', 'url', False, tracks)
         self.assertFalse(ok)

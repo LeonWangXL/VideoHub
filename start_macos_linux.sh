@@ -1,4 +1,4 @@
 #!/usr/bin/env sh
 set -eu
 cd "$(dirname "$0")"
-python3 videohub_helper.py
+python3 -u videohub_helper.py

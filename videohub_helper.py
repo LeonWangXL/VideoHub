@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-VideoHub local helper v2.1.0
+VideoHub local helper v2.2.1
 
 Compatible with the existing VideoHub v2.0 Tampermonkey userscript.
 
@@ -40,7 +40,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 
-VERSION = "2.1.0"
+VERSION = "2.3.2"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 
@@ -50,6 +50,7 @@ DEFAULT_CONFIG = {
     "download_dir": "~/Downloads/VideoHub",
     "browser": "chrome",
     "browser_profile": "",
+    "proxy": None,  # null inherits system/environment; empty string uses a direct connection.
 
     "subtitle_languages": ["en", "zh-Hans"],
     "write_auto_subtitles": True,
@@ -215,6 +216,96 @@ def validate_single_item_url(raw_url: str) -> tuple[str, str]:
     return platform, raw_url
 
 
+def playlist_url(raw_url):
+    u = urlparse(raw_url)
+    value = parse_qs(u.query).get("list", [""])[0]
+    if (len(raw_url) > 8192 or u.scheme != "https" or u.username or u.password
+            or not is_domain(u.hostname or "", "youtube.com")
+            or u.path not in {"/watch", "/playlist"}
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,150}", value)):
+        raise ValueError("请提供带 list 参数的 YouTube 播放列表地址")
+    return "https://www.youtube.com/playlist?list=" + value
+
+
+def list_playlist(raw_url, use_cookies):
+    url = playlist_url(raw_url)
+    print(f"[PLAYLIST] 开始解析 {url}", flush=True)
+    cmd = common_command("youtube", use_cookies)
+    cmd += ["--ignore-config", "--yes-playlist", "--flat-playlist", "--skip-download",
+            "--playlist-end", "501", "--dump-single-json", url]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", env=child_env(), timeout=90)
+    except subprocess.TimeoutExpired:
+        print("[PLAYLIST] 解析超时（90 秒），请重试", flush=True)
+        raise ValueError("播放列表解析超时，请重试") from None
+    if proc.returncode:
+        print("[PLAYLIST] 解析失败：" + network_error_message(proc.stderr), flush=True)
+        raise ValueError(network_error_message(proc.stderr) or "播放列表解析失败")
+    info = json.loads(proc.stdout)
+    entries = info.get("entries") or []
+    if len(entries) > 500:
+        raise ValueError("播放列表超过 500 项，请使用较小的播放列表")
+    items = []
+    for index, entry in enumerate(entries, 1):
+        if not entry or not re.fullmatch(r"[A-Za-z0-9_-]{11}", entry.get("id") or ""):
+            continue
+        items.append({"url": "https://www.youtube.com/watch?v=" + entry["id"],
+                      "title": entry.get("title") or entry["id"], "index": index})
+    if not items:
+        raise ValueError("播放列表为空或没有可识别的视频")
+    print(f"[PLAYLIST] 解析完成：{len(items)} 项", flush=True)
+    return {"title": info.get("title") or "YouTube 播放列表", "items": items}
+
+
+def validate_batch_urls(values):
+    if not isinstance(values, list) or not 1 <= len(values) <= 500:
+        raise ValueError("请选择 1 至 500 个视频")
+    result = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("视频地址无效")
+        platform, url = validate_single_item_url(value)
+        if platform != "youtube":
+            raise ValueError("批量下载目前仅支持 YouTube")
+        url = clean_url_for_platform(platform, url)
+        if url not in result:
+            result.append(url)
+    return result
+
+
+def run_batch(job_id, urls, mode, use_cookies, include_subtitles, tracks):
+    results = []
+    print(f"[BATCH {job_id}] 开始：{len(urls)} 项，类型 {mode}", flush=True)
+    try:
+        for index, url in enumerate(urls, 1):
+            print(f"[BATCH {job_id}] 第 {index}/{len(urls)} 项：{url}", flush=True)
+            update_job(job_id, state="downloading", percent=f"{index - 1}/{len(urls)}",
+                       message=f"正在处理第 {index}/{len(urls)} 项")
+            child_id = uuid.uuid4().hex
+            with jobs_lock:
+                jobs[child_id] = {"parent_id": job_id, "batch_index": index, "batch_total": len(urls)}
+            try:
+                run_download(child_id, "youtube", url, mode, use_cookies, include_subtitles, tracks)
+                with jobs_lock:
+                    result = dict(jobs[child_id])
+                print(f"[BATCH {job_id}] 第 {index}/{len(urls)} 项 {result.get('state')}：{redact_line(result.get('message') or '')}", flush=True)
+                results.append({"url": url, "state": result.get("state"),
+                                "message": result.get("message"), "warning": result.get("warning")})
+                update_job(job_id, results=list(results), completed=index, total=len(urls),
+                           message=f"已处理 {index}/{len(urls)} 项", percent=f"{index}/{len(urls)}")
+            finally:
+                with jobs_lock:
+                    jobs.pop(child_id, None)
+        failed = sum(r["state"] != "done" for r in results)
+        warnings = sum(bool(r["warning"]) for r in results)
+        print(f"[BATCH {job_id}] 结束：成功 {len(results) - failed}，失败 {failed}，字幕警告 {warnings}", flush=True)
+        update_job(job_id, state="error" if failed else "done", percent="100%", speed=None, eta=None, results=results,
+                   message=f"批量结束：成功 {len(results) - failed}，失败 {failed}，字幕警告 {warnings}；文件保存到 {platform_dir('youtube')}")
+    except Exception as exc:
+        update_job(job_id, state="error", results=results, message=redact_line(str(exc))[:1000])
+
+
 def clean_url_for_platform(platform: str, raw_url: str) -> str:
     u = urlparse(raw_url)
 
@@ -267,7 +358,13 @@ def platform_dir(platform: str) -> Path:
 def update_job(job_id: str, **fields) -> None:
     with jobs_lock:
         if job_id in jobs:
-            jobs[job_id].update(fields)
+            job = jobs[job_id]
+            job.update(fields)
+            parent = jobs.get(job.get("parent_id"))
+            if parent is not None:
+                parent.update(state="downloading", speed=job.get("speed"), eta=job.get("eta"),
+                              message=f"第 {job['batch_index']}/{job['batch_total']} 项：{job.get('message', '处理中')}",
+                              percent=job.get("percent"))
 
 
 def redact_line(line: str) -> str:
@@ -897,6 +994,30 @@ def cleanup_summary(results: list[dict]) -> str:
 # yt-dlp command construction
 # ---------------------------------------------------------------------------
 
+def proxy_arguments():
+    proxy = CONFIG.get("proxy")
+    if proxy is None:
+        return []
+    if not isinstance(proxy, str):
+        raise ValueError("config.json 中 proxy 必须为 URL 字符串、空字符串或 null")
+    if proxy:
+        u = urlparse(proxy)
+        try:
+            valid = u.scheme in {"http", "https", "socks4", "socks4a", "socks5", "socks5h"} and u.hostname and u.port
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("config.json 中 proxy 地址无效，例如 http://127.0.0.1:17891")
+    return ["--proxy", proxy]
+
+
+def network_error_message(value):
+    if "Unable to connect to proxy" in value or "ProxyError" in value:
+        return ("无法连接代理服务器。请确认代理程序正在运行，且 config.json 中 proxy 端口正确；"
+                "未配置 proxy 时会继承环境变量或系统代理。修改配置后请重启 VideoHub 本地服务。")
+    return redact_line(value)[-900:]
+
+
 def common_command(
     platform: str,
     use_cookies: bool,
@@ -934,6 +1055,8 @@ def common_command(
         "-o",
         "%(title).180B [%(id)s].%(ext)s",
     ]
+
+    cmd += proxy_arguments()
 
     if use_cookies:
         cmd += [
@@ -1051,21 +1174,32 @@ def validate_subtitle_tracks(value):
                 or item["language"] == "live_chat"):
             raise ValueError("字幕选项无效，请重新加载字幕列表")
         track = {"source": item["source"], "language": item["language"]}
+        if "translated" in item:
+            if not isinstance(item["translated"], bool) or (item["source"] == "manual" and item["translated"]):
+                raise ValueError("字幕翻译类型无效")
+            track["translated"] = item["translated"]
+        if "fallback" in item:
+            if not isinstance(item["fallback"], str) or item["fallback"] not in {"none", "zh-auto"}:
+                raise ValueError("字幕缺失处理选项无效")
+            track["fallback"] = item["fallback"]
         if track not in result:
             result.append(track)
     return result
 
 
 def list_subtitle_tracks(platform, url, use_cookies):
+    print(f"[SUBTITLES] 开始查询 {clean_url_for_platform(platform, url)}", flush=True)
     cmd = common_command(platform, use_cookies)
     cmd += ["--ignore-config", "--skip-download", "--ignore-no-formats-error", "--dump-single-json", url]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                               errors="replace", env=child_env(), timeout=90)
     except subprocess.TimeoutExpired:
+        print("[SUBTITLES] 查询超时（90 秒），请重试", flush=True)
         raise ValueError("字幕列表解析超时，请稍后重试") from None
     if proc.returncode:
-        raise ValueError(redact_line(proc.stderr)[-900:] or "字幕列表解析失败")
+        print("[SUBTITLES] 查询失败：" + network_error_message(proc.stderr), flush=True)
+        raise ValueError(network_error_message(proc.stderr) or "字幕列表解析失败")
     info = json.loads(proc.stdout)
     tracks = []
     for source, key in (("manual", "subtitles"), ("auto", "automatic_captions")):
@@ -1079,6 +1213,7 @@ def list_subtitle_tracks(platform, url, use_cookies):
             tracks.append({"language": language, "source": source,
                            "name": formats[0].get("name") or language,
                            "translated": translated})
+    print(f"[SUBTITLES] 查询完成：{len(tracks)} 种字幕", flush=True)
     return sorted(tracks, key=lambda t: (t["translated"], t["source"] == "auto", t["language"]))
 
 
@@ -1370,6 +1505,8 @@ def tail_message(
     limit: int = 900,
 ) -> str:
     value = " | ".join(lines)
+    if "Unable to connect to proxy" in value or "ProxyError" in value:
+        return network_error_message(value)
 
     if len(value) > limit:
         return value[-limit:]
@@ -1394,22 +1531,55 @@ def has_http_429(
 # Job orchestration
 # ---------------------------------------------------------------------------
 
+def matching_subtitle_tracks(available, language, source=None):
+    candidates = [t for t in available if source is None or t["source"] == source]
+    exact = [t for t in candidates if t["language"] == language]
+    if exact:
+        return exact
+    # YouTube labels the same original language differently between videos.
+    aliases = {language + "-orig"}
+    if language.endswith("-orig"):
+        aliases.add(language[:-5])
+    if language in {"zh", "zh-Hans", "zh-orig"}:
+        aliases.update({"zh", "zh-orig"})
+    return [t for t in candidates if t["language"] in aliases and not t.get("translated", False)]
+
+
 def optional_subtitles(job_id, platform, url, use_cookies, subtitle_tracks=None):
-    tracks = subtitle_tracks
-    if tracks is None:
-        available = list_subtitle_tracks(platform, url, use_cookies)
+    available = list_subtitle_tracks(platform, url, use_cookies)
+    failures, successes, tracks, replacements = [], [], [], []
+    if subtitle_tracks is None:
         preferred = CONFIG.get("subtitle_languages") or ["en", "zh-Hans"]
-        tracks = []
         for language in preferred:
-            candidates = [t for t in available if t["language"] in {language, language + "-orig"}]
-            candidates.sort(key=lambda t: (t["source"] == "auto", t["translated"], not t["language"].endswith("-orig")))
-            if candidates:
+            candidates = matching_subtitle_tracks(available, language)
+            candidates += [t for t in available if t["language"] == language + "-orig" and t not in candidates]
+            candidates.sort(key=lambda t: (t["source"] == "auto", t.get("translated", False), not t["language"].endswith("-orig")))
+            if candidates and candidates[0] not in tracks:
                 tracks.append(candidates[0])
         if not tracks:
-            tracks = [t for t in available if t["source"] == "auto" and not t["translated"]][:1]
+            originals = [t for t in available if not t.get("translated", False)]
+            originals.sort(key=lambda t: t["source"] == "auto")
+            tracks = originals[:1]
+    else:
+        for requested in subtitle_tracks:
+            pool = available
+            if "translated" in requested:
+                pool = [t for t in available if bool(t.get("translated")) == requested["translated"]]
+            candidates = matching_subtitle_tracks(pool, requested["language"], requested["source"])
+            if not candidates and requested.get("fallback") == "zh-auto":
+                fallback_pool = [t for t in available if t["source"] == "auto" and not t.get("translated", False)]
+                candidates = matching_subtitle_tracks(fallback_pool, "zh-Hans", "auto")
+                if candidates:
+                    replacements.append(requested["language"] + "/" + requested["source"] + " 缺失，改用中文自动生成字幕")
+            if candidates:
+                if candidates[0] not in tracks:
+                    tracks.append(candidates[0])
+            else:
+                kind = "原始字幕（作者上传）" if requested["source"] == "manual" else (
+                    "自动翻译" if requested.get("translated") else "自动生成" if "translated" in requested else "自动字幕")
+                failures.append(requested["language"] + "/" + kind + ": 此视频未提供该语言和来源的字幕")
     if not tracks:
-        return False, "没有可下载的字幕，或尚未选择字幕"
-    failures, successes = [], []
+        return False, "；".join(failures) or "此视频未发现可下载字幕"
     out_dir = platform_dir(platform)
     for track in tracks:
         label = track["language"] + "/" + track["source"]
@@ -1433,6 +1603,8 @@ def optional_subtitles(job_id, platform, url, use_cookies, subtitle_tracks=None)
             reason = "429 限流" if has_http_429(tail) else (tail_message(tail, 250) if code else "未生成字幕文件")
             failures.append(f"{label}: {reason}")
     message = ("已保存字幕：" + ", ".join(successes)) if successes else "字幕下载失败"
+    if replacements:
+        message += "；替代：" + "；".join(replacements)
     if failures:
         message += "；失败：" + "；".join(failures)
     return not failures, message
@@ -1642,6 +1814,8 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "version": VERSION,
+                    "subtitle_selection_types": True,
+                    "subtitle_fallback": True,
                     "token": server_token,
                     "yt_dlp_version":
                     package_version("yt-dlp"),
@@ -1731,7 +1905,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if (
             urlparse(self.path).path
-            not in {"/download", "/subtitles"}
+            not in {"/download", "/subtitles", "/playlist", "/batch"}
         ):
             return self._json(
                 404,
@@ -1765,6 +1939,14 @@ class Handler(BaseHTTPRequestHandler):
 
             if not isinstance(payload, dict):
                 raise ValueError("请求体必须是 JSON 对象")
+
+            route = urlparse(self.path).path
+            if route == "/playlist":
+                return self._json(200, list_playlist(str(payload.get("url", "")),
+                                                     bool(payload.get("use_cookies", False))))
+            batch_urls = validate_batch_urls(payload.get("urls")) if route == "/batch" else None
+            if batch_urls:
+                payload["url"] = batch_urls[0]
 
             platform, url = validate_single_item_url(
                 str(
@@ -1837,8 +2019,9 @@ class Handler(BaseHTTPRequestHandler):
                 }
 
             threading.Thread(
-                target=run_download,
-                args=(
+                target=run_batch if batch_urls else run_download,
+                args=(job_id, batch_urls, mode, use_cookies, include_subtitles, subtitle_tracks)
+                if batch_urls else (
                     job_id,
                     platform,
                     url,
